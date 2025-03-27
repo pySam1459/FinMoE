@@ -3,9 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from peft import PeftModel
-from transformers.cache_utils import Cache
+from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutput
 from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaRMSNorm
-from typing import Optional, Union
+from typing import Optional
 
 
 class Top1Gating(nn.Module):
@@ -47,14 +49,16 @@ def load_expert(model_id: str, expert_ckpt: str) -> PeftModel:
     return PeftModel.from_pretrained(base_model, expert_ckpt, torch_dtype="float16")
 
 
-class FinMoE(nn.Module):
+class FinMoE(PreTrainedModel):
     gating_model_id = "meta-llama/Llama-3.2-1B"
     expert_model_id = "meta-llama/Llama-3.2-1B"
 
-    def __init__(self, expert_ckpts: list[Path],
+    def __init__(self, 
+                 config: PretrainedConfig,
+                 expert_ckpts: list[Path],
                  max_context_length: int):
 
-        super(FinMoE, self).__init__()
+        super(FinMoE, self).__init__(config)
         self.gate = Top1Gating(FinMoE.gating_model_id, len(expert_ckpts))
 
         self.experts = nn.ModuleList([load_expert(FinMoE.expert_model_id, exp_ckpt) for exp_ckpt in expert_ckpts])
@@ -69,7 +73,8 @@ class FinMoE(nn.Module):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None
+        labels: Optional[torch.LongTensor] = None,
+        **loss_kwargs
     ):
         ## expert routing probs
         expert_probs = self.gate.forward(input_ids, attention_mask)  # (B, E)
@@ -77,14 +82,14 @@ class FinMoE(nn.Module):
         ## select top-1 expert index for each sample
         top1_indices = expert_probs.argmax(dim=-1)  # (B,)
         batch_size = expert_probs.size(0)
-  
+
         combined_output = torch.zeros((batch_size, self.max_context_length, self.vocab_size),
                                       dtype=torch.float16,
                                       device=expert_probs.device)
         
         # For each expert, process only the samples routed to it.
         for expert_idx, expert in enumerate(self.experts):
-            mask = (top1_indices == expert_idx)
+            mask = (top1_indices == expert_idx) # mask over batches
             if mask.any():
                 selected_input_ids = input_ids[mask]
                 selected_attention = attention_mask[mask] if attention_mask is not None else None
@@ -98,5 +103,9 @@ class FinMoE(nn.Module):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
 
-        
-        return combined_output
+        return CausalLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=None,
+            attentions=None,
+        )
