@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,6 +44,27 @@ class Top1Gating(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return probs
 
+    def save_pretrained(self, save_directory: str, **kwargs):
+        os.makedirs(save_directory, exist_ok=True)
+        trainable_keys = {name
+                          for name, param in self.named_parameters()
+                          if param.requires_grad}
+
+        state_dict = self.state_dict()
+        trainable_state_dict = {k: v
+                                for k, v in state_dict.items()
+                                if k in trainable_keys}
+
+        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_finmoe_gate_trainable.bin"))
+
+    def load_pretrained(self, load_directory: str, **kwargs):
+        load_path = os.path.join(load_directory, "pytorch_finmoe_gate_trainable.bin")
+        if os.path.exists(load_path):
+            trainable_state_dict = torch.load(load_path, map_location="cpu")
+            self.load_state_dict(trainable_state_dict, strict=False) # strict=False as only some weights are loaded
+        else:
+            raise FileNotFoundError(f"No trainable checkpoint found at {load_path}")
+
 
 def load_expert(model_id: str, expert_ckpt: str) -> PeftModel:
     base_model = LlamaForCausalLM.from_pretrained(model_id, torch_dtype="float16")
@@ -55,8 +77,7 @@ class FinMoE(PreTrainedModel):
 
     def __init__(self, 
                  config: PretrainedConfig,
-                 expert_ckpts: list[Path],
-                 max_context_length: int):
+                 expert_ckpts: list[Path]):
 
         super(FinMoE, self).__init__(config)
         self.gate = Top1Gating(FinMoE.gating_model_id, len(expert_ckpts))
@@ -66,7 +87,6 @@ class FinMoE(PreTrainedModel):
             for param in expert.parameters():
                 param.requires_grad = False
 
-        self.max_context_length = max_context_length
         self.vocab_size = self.experts[0].config.vocab_size
     
     def forward(
@@ -74,6 +94,7 @@ class FinMoE(PreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        max_context_length: int = 512,
         **loss_kwargs
     ):
         ## expert routing probs
@@ -83,7 +104,7 @@ class FinMoE(PreTrainedModel):
         top1_indices = expert_probs.argmax(dim=-1)  # (B,)
         batch_size = expert_probs.size(0)
 
-        combined_output = torch.zeros((batch_size, self.max_context_length, self.vocab_size),
+        combined_output = torch.zeros((batch_size, max_context_length, self.vocab_size),
                                       dtype=torch.float16,
                                       device=expert_probs.device)
         
@@ -109,3 +130,36 @@ class FinMoE(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        os.makedirs(save_directory, exist_ok=True)
+
+        # Determine trainable parameter keys in the entire model
+        trainable_keys = {name for name, param in self.named_parameters() if param.requires_grad}
+        state_dict = self.state_dict()
+        trainable_state_dict = {k: v for k, v in state_dict.items() if k in trainable_keys}
+
+        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_finmoe_trainable.bin"))
+        self.config.save_pretrained(save_directory)
+
+        gate_save_dir = os.path.join(save_directory, "gate")
+        self.gate.save_pretrained(gate_save_dir)
+
+    @classmethod
+    def load_pretrained(cls, load_directory: str, expert_ckpts: list, max_context_length: int, **kwargs):
+        config = PretrainedConfig.from_pretrained(load_directory)
+        model = cls(config, expert_ckpts, max_context_length)
+        
+        # Load the trainable parameters for FinMoE
+        trainable_path = os.path.join(load_directory, "pytorch_finmoe_trainable.bin")
+        if os.path.exists(trainable_path):
+            trainable_state_dict = torch.load(trainable_path, map_location="cpu")
+            model.load_state_dict(trainable_state_dict, strict=False)  # strict=False as only some weights are loaded
+        else:
+            raise FileNotFoundError(f"No trainable checkpoint found at {trainable_path}")
+        
+        # Load the gating network's trainable parameters from its subdirectory
+        gate_dir = os.path.join(load_directory, "gate")
+        model.gate.load_pretrained(gate_dir)
+        
+        return model
