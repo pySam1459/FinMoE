@@ -60,7 +60,7 @@ class Top1Gating(nn.Module):
     def load_pretrained(self, load_directory: str, **kwargs):
         load_path = os.path.join(load_directory, "pytorch_finmoe_gate_trainable.bin")
         if os.path.exists(load_path):
-            trainable_state_dict = torch.load(load_path, map_location="cpu")
+            trainable_state_dict = torch.load(load_path, map_location="cpu", weights_only=False)
             self.load_state_dict(trainable_state_dict, strict=False) # strict=False as only some weights are loaded
         else:
             raise FileNotFoundError(f"No trainable checkpoint found at {load_path}")
@@ -146,14 +146,14 @@ class FinMoE(PreTrainedModel):
         self.gate.save_pretrained(gate_save_dir)
 
     @classmethod
-    def load_pretrained(cls, load_directory: str, expert_ckpts: list, max_context_length: int, **kwargs):
+    def load_pretrained(cls, load_directory: str, expert_ckpts: list, **kwargs):
         config = PretrainedConfig.from_pretrained(load_directory)
-        model = cls(config, expert_ckpts, max_context_length)
+        model = cls(config, expert_ckpts)
         
         # Load the trainable parameters for FinMoE
         trainable_path = os.path.join(load_directory, "pytorch_finmoe_trainable.bin")
         if os.path.exists(trainable_path):
-            trainable_state_dict = torch.load(trainable_path, map_location="cpu")
+            trainable_state_dict = torch.load(trainable_path, map_location="cpu", weights_only=False)
             model.load_state_dict(trainable_state_dict, strict=False)  # strict=False as only some weights are loaded
         else:
             raise FileNotFoundError(f"No trainable checkpoint found at {trainable_path}")
