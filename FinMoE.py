@@ -67,10 +67,10 @@ class Top1Gating(nn.Module):
                                 for k, v in state_dict.items()
                                 if k in trainable_keys}
 
-        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_finmoe_gate_trainable.bin"))
+        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_model.bin"))
 
     def load_pretrained(self, load_directory: str, **kwargs):
-        load_path = os.path.join(load_directory, "pytorch_finmoe_gate_trainable.bin")
+        load_path = os.path.join(load_directory, "pytorch_model.bin")
         if os.path.exists(load_path):
             trainable_state_dict = torch.load(load_path, map_location="cpu", weights_only=False)
             self.load_state_dict(trainable_state_dict, strict=False) # strict=False as only some weights are loaded
@@ -84,6 +84,8 @@ def load_expert(model_id: str, expert_ckpt: str, dtype="float16") -> PeftModel:
 
 
 class FinMoE(PreTrainedModel):
+    config_class = FinMoEConfig
+
     def __init__(self, config: FinMoEConfig):
         super(FinMoE, self).__init__(config)
 
@@ -134,7 +136,7 @@ class FinMoE(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
 
         return CausalLMOutput(
             loss=loss,
@@ -151,19 +153,19 @@ class FinMoE(PreTrainedModel):
         state_dict = self.state_dict()
         trainable_state_dict = {k: v for k, v in state_dict.items() if k in trainable_keys}
 
-        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_finmoe_trainable.bin"))
+        torch.save(trainable_state_dict, os.path.join(save_directory, "pytorch_model.bin"))
         self.config.save_pretrained(save_directory)
 
         gate_save_dir = os.path.join(save_directory, "gate")
         self.gate.save_pretrained(gate_save_dir)
 
     @classmethod
-    def load_pretrained(cls, load_directory: str, expert_ckpts: list, **kwargs):
+    def load_pretrained(cls, load_directory: str, **kwargs):
         config = PretrainedConfig.from_pretrained(load_directory)
-        model = cls(config, expert_ckpts)
+        model = cls(config)
         
         # Load the trainable parameters for FinMoE
-        trainable_path = os.path.join(load_directory, "pytorch_finmoe_trainable.bin")
+        trainable_path = os.path.join(load_directory, "pytorch_model.bin")
         if os.path.exists(trainable_path):
             trainable_state_dict = torch.load(trainable_path, map_location="cpu", weights_only=False)
             model.load_state_dict(trainable_state_dict, strict=False)  # strict=False as only some weights are loaded
