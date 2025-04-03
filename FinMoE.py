@@ -15,34 +15,20 @@ class FinMoEConfig(PretrainedConfig):
         super(FinMoEConfig, self).__init__(**kwargs)
 
         self.expert_ckpts = kwargs.pop("expert_ckpts", [])
-
-        llama_32_1b_model_id = "meta-llama/Llama-3.2-1B"
-        self.gate_model_id = kwargs.pop("gate_model_id", llama_32_1b_model_id)
-        self.expert_model_id = kwargs.pop("expert_model_id", llama_32_1b_model_id)
-
-        self.n_gate_layers = kwargs.pop("n_gate_layers", 8)
+        self.model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-1B")
+        self.n_gate_layers = kwargs.pop("n_gate_layers", 16)
 
 
 class Top1Gating(nn.Module):
     """Gating network that uses the first `num_layers` of Llama as a feature extractor"""
-    def __init__(self, model_id: str,
-                 num_experts: int,
-                 num_layers: int):
+    def __init__(self, llama: LlamaModel, num_experts: int):
         super(Top1Gating, self).__init__()
 
-        full_model = LlamaModel.from_pretrained(model_id, output_hidden_states=True)
-
-        ## remove extra layers from Llama model
-        full_model.layers = nn.ModuleList(full_model.layers[:num_layers])
-        full_model.config.num_hidden_layers = num_layers
-        for param in full_model.parameters(): ## freeze Llama model
-            param.requires_grad = False
-
-        self.llama = full_model
+        self.llama = llama
 
         ## create new RMSNorm layer and classifier head
-        hidden_size = full_model.config.hidden_size # C
-        self.norm = LlamaRMSNorm(hidden_size, full_model.config.rms_norm_eps)
+        hidden_size = llama.config.hidden_size # C
+        self.norm = LlamaRMSNorm(hidden_size, llama.config.rms_norm_eps)
         self.classifier = nn.Linear(hidden_size, num_experts) # (C, E)
     
     def forward(self, input_ids, attention_mask=None) -> torch.Tensor:
@@ -78,28 +64,31 @@ class Top1Gating(nn.Module):
             raise FileNotFoundError(f"No trainable checkpoint found at {load_path}")
 
 
-def load_expert(model_id: str, expert_ckpt: str, dtype="float16") -> PeftModel:
-    base_model = LlamaForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
-    return PeftModel.from_pretrained(base_model, expert_ckpt, torch_dtype=dtype)
-
-
 class FinMoE(PreTrainedModel):
     config_class = FinMoEConfig
 
     def __init__(self, config: FinMoEConfig):
         super(FinMoE, self).__init__(config)
 
-        self.n_experts = len(config.expert_ckpts)
-        self.gate = Top1Gating(config.gate_model_id,
-                               self.n_experts,
-                               num_layers=config.n_gate_layers)
-        
-        self.experts = nn.ModuleList([load_expert(config.expert_model_id, exp_ckpt) for exp_ckpt in config.expert_ckpts])
-        for expert in self.experts: ## freeze expert models
-            for param in expert.parameters():
-                param.requires_grad = False
+        ## load base_model
+        llama = LlamaForCausalLM.from_pretrained(config.model_id,
+                                                 output_hidden_states=True,
+                                                 torch_dtype=config.torch_dtype)
 
-        self.vocab_size = self.experts[0].config.vocab_size
+        ## Load LoRA adapters onto PeftModel
+        self.n_experts = len(config.expert_ckpts)
+        self.expert = PeftModel.from_pretrained(llama, config.expert_ckpts[0], adapter_name="0")
+        for i, ckpt in enumerate(config.expert_ckpts[1:], start=1):
+            self.expert.load_adapter(ckpt, adapter_name=str(i))
+
+        # freeze base model and LoRA adapter params
+        for param in self.expert.parameters(): 
+            param.requires_grad = False
+
+        ## pass LlamaModel to Top1Gating
+        self.gate = Top1Gating(llama.model, self.n_experts)
+
+        self.vocab_size = self.expert.config.vocab_size
     
     def forward(
         self,
@@ -117,8 +106,8 @@ class FinMoE(PreTrainedModel):
 
         context_length = input_ids.shape[1]
         combined_output = torch.zeros((batch_size, context_length, self.vocab_size),
-                                      dtype=torch.float16,
-                                      device=expert_probs.device)
+                                      dtype=self.config.torch_dtype,
+                                      device=self.device)
         
         # For each expert, process only the samples routed to it.
         for expert_idx in range(self.n_experts):
@@ -128,8 +117,10 @@ class FinMoE(PreTrainedModel):
 
             selected_input_ids = input_ids[mask]
             selected_attention = attention_mask[mask] if attention_mask is not None else None
-            expert_out = self.experts[expert_idx](selected_input_ids, selected_attention)
-            combined_output[mask] = expert_out.logits
+
+            self.expert.set_adapter(str(expert_idx))
+            expert_out = self.expert(selected_input_ids, selected_attention)
+            combined_output[mask] += expert_out.logits
 
         chosen_probs = expert_probs.gather(1, top1_indices.unsqueeze(1))  # shape (B, 1)
         logits = combined_output * chosen_probs
