@@ -6,7 +6,7 @@ from peft import PeftModel
 from transformers.modeling_utils import PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutput
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaRMSNorm
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel
 from typing import Optional
 
 
@@ -16,7 +16,7 @@ class FinMoEConfig(PretrainedConfig):
 
         self.expert_ckpts = kwargs.pop("expert_ckpts", [])
         self.model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-1B")
-        self.n_gate_layers = kwargs.pop("n_gate_layers", 16)
+        self.token_mask = kwargs.pop("token_mask", None)
 
 
 class Top1Gating(nn.Module):
@@ -25,20 +25,14 @@ class Top1Gating(nn.Module):
         super(Top1Gating, self).__init__()
 
         self.llama = llama
-
-        ## create new RMSNorm layer and classifier head
-        hidden_size = llama.config.hidden_size # C
-        self.norm = LlamaRMSNorm(hidden_size, llama.config.rms_norm_eps)
-        self.classifier = nn.Linear(hidden_size, num_experts) # (C, E)
+        self.w_gate = nn.Linear(llama.config.hidden_size, num_experts) # (C, E)
     
     def forward(self, input_ids, attention_mask=None) -> torch.Tensor:
         outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # (B, T, C)
 
-        hidden_states = self.norm(hidden_states) ## TODO: is this norm layer necessary?
-        pooled = hidden_states[:, 0, :] # (B, C)
+        pooled = outputs.last_hidden_state[:, 0, :] # (B, C)
 
-        logits = self.classifier(pooled)  # (B, E)
+        logits = self.w_gate(pooled)  # (B, E)
         probs = F.softmax(logits, dim=-1)
         return probs
 
@@ -89,6 +83,15 @@ class FinMoE(PreTrainedModel):
         self.gate = Top1Gating(llama.model, self.n_experts)
 
         self.vocab_size = self.expert.config.vocab_size
+        self.token_mask = self.config.token_mask
+
+        if self.token_mask is not None:
+            inv_token_mapping = {t: i for i, t in enumerate(self.token_mask)}
+            max_key = max(inv_token_mapping.keys())
+            self.inv_token_lookup = torch.full((max_key + 1,), -1)
+            for k, v in inv_token_mapping.items():
+                self.inv_token_lookup[k] = v
+            self.inv_token_lookup = self.inv_token_lookup.to(self.device)
     
     def forward(
         self,
@@ -101,33 +104,51 @@ class FinMoE(PreTrainedModel):
         expert_probs = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
         ## select top-1 expert index for each sample
-        top1_indices = expert_probs.argmax(dim=-1)  # (B,)
+        # top1_indices = expert_probs.argmax(dim=-1)  # (B,)
         batch_size = expert_probs.size(0)
 
         context_length = input_ids.shape[1]
-        combined_output = torch.zeros((batch_size, context_length, self.vocab_size),
-                                      dtype=self.config.torch_dtype,
-                                      device=self.device)
-        
+        vocab_size = len(self.token_mask) if self.token_mask is not None else self.vocab_size
+        logits = torch.zeros((batch_size, context_length, vocab_size), # (B,T,V)
+                              dtype=self.config.torch_dtype,
+                              device=self.device)
+
         # For each expert, process only the samples routed to it.
         for expert_idx in range(self.n_experts):
-            mask = (top1_indices == expert_idx) # mask over batches
-            if not mask.any():
-                continue
+            # mask = (top1_indices == expert_idx) # mask over batches
+            # if not mask.any():
+            #     continue
 
-            selected_input_ids = input_ids[mask]
-            selected_attention = attention_mask[mask] if attention_mask is not None else None
+            # selected_input_ids = input_ids[mask]
+            # selected_attention = attention_mask[mask] if attention_mask is not None else None
 
             self.expert.set_adapter(str(expert_idx))
-            expert_out = self.expert(selected_input_ids, selected_attention)
-            combined_output[mask] += expert_out.logits
+            expert_out = self.expert(input_ids, attention_mask) # (B,T,V)
 
-        chosen_probs = expert_probs.gather(1, top1_indices.unsqueeze(1))  # shape (B, 1)
-        logits = combined_output * chosen_probs
+            index = torch.LongTensor([[expert_idx]]*batch_size).to(expert_probs.device) # (B, 1)
+            if self.token_mask is not None:
+                expert_logits = expert_out.logits[:,:,self.token_mask]
+            else:
+                expert_logits = expert_out.logits
+
+            weighted_logits = expert_logits * expert_probs.gather(1, index).unsqueeze(2)
+            logits += weighted_logits
+            # expert_out = self.expert(selected_input_ids, selected_attention)
+            # combined_output[mask] += expert_out.logits
+
+        # chosen_probs = expert_probs.gather(1, top1_indices.unsqueeze(1))  # shape (B, 1)
+        # logits = combined_output * chosen_probs
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
+            gen_idx = attention_mask.sum(dim=1).long() - 1
+            pooled_logits = logits[torch.arange(logits.size(0)),gen_idx,:]
+            print(labels)
+            loss = self.loss_function(labels=labels, pooled_logits=pooled_logits, config=self.config)
+            # loss = self.loss_function(logits=logits,
+            #                           labels=labels,
+            #                           vocab_size=self.vocab_size,
+            #                           **loss_kwargs)
 
         return CausalLMOutput(
             loss=loss,
