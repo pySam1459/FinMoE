@@ -6,7 +6,8 @@ from peft import PeftModel
 from transformers.modeling_utils import PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutput
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaRMSNorm
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel
+from transformers.loss.loss_utils import ForCausalLMLoss, ForTokenClassification
 from typing import Optional
 
 
@@ -18,6 +19,8 @@ class FinMoEConfig(PretrainedConfig):
         self.model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-1B")
         self.n_gate_layers = kwargs.pop("n_gate_layers", 16)
 
+        self.token_list = kwargs.pop("token_list", None)
+
 
 class Top1Gating(nn.Module):
     """Gating network that uses the first `num_layers` of Llama as a feature extractor"""
@@ -25,22 +28,29 @@ class Top1Gating(nn.Module):
         super(Top1Gating, self).__init__()
 
         self.llama = llama
+        self.w_gate = nn.Linear(llama.config.hidden_size, num_experts) # (C, E)
 
-        ## create new RMSNorm layer and classifier head
-        hidden_size = llama.config.hidden_size # C
-        self.norm = LlamaRMSNorm(hidden_size, llama.config.rms_norm_eps)
-        self.classifier = nn.Linear(hidden_size, num_experts) # (C, E)
+        self.epsilon = 1e-6
     
     def forward(self, input_ids, attention_mask=None) -> torch.Tensor:
         outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # (B, T, C)
+        pooled = outputs.last_hidden_state[:, 0, :]
 
-        hidden_states = self.norm(hidden_states) ## TODO: is this norm layer necessary?
-        pooled = hidden_states[:, 0, :] # (B, C)
+        gate_scores = self.w_gate(pooled)  # (B, E)
 
-        logits = self.classifier(pooled)  # (B, E)
-        probs = F.softmax(logits, dim=-1)
-        return probs
+        _, top1_indices = gate_scores.topk(1, dim=-1)
+        
+        mask = torch.zeros_like(gate_scores).scatter_(
+            1, top1_indices, 1
+        )
+        masked_gate_scores = gate_scores * mask
+        denominators = masked_gate_scores.sum(0, keepdim=True) + self.epsilon
+        
+        # Norm gate scores to sum to 1
+        gate_scores = masked_gate_scores / denominators
+
+        return gate_scores, top1_indices.squeeze(0)
+
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
@@ -97,15 +107,10 @@ class FinMoE(PreTrainedModel):
         labels: Optional[torch.LongTensor] = None,
         **loss_kwargs
     ):
-        ## expert routing probs
-        expert_probs = self.gate.forward(input_ids, attention_mask)  # (B, E)
+        ## expert routing produces gate scores
+        gate_scores, top1_indices = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
-        ## select top-1 expert index for each sample
-        top1_indices = expert_probs.argmax(dim=-1)  # (B,)
-        batch_size = expert_probs.size(0)
-
-        context_length = input_ids.shape[1]
-        combined_output = torch.zeros((batch_size, context_length, self.vocab_size),
+        combined_output = torch.zeros(input_ids.shape + (self.vocab_size, ),
                                       dtype=self.config.torch_dtype,
                                       device=self.device)
         
@@ -120,14 +125,23 @@ class FinMoE(PreTrainedModel):
 
             self.expert.set_adapter(str(expert_idx))
             expert_out = self.expert(selected_input_ids, selected_attention)
-            combined_output[mask] += expert_out.logits
+            combined_output[mask] = expert_out.logits
 
-        chosen_probs = expert_probs.gather(1, top1_indices.unsqueeze(1))  # shape (B, 1)
-        logits = combined_output * chosen_probs
+        logits = combined_output * gate_scores.gather(1, top1_indices.unsqueeze(0))
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
+            if self.config.loss_type == "ForCausalLM":
+                loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
+
+            elif self.config.loss_type == "ForTokenClassification" and self.config.token_list is not None:
+                gen_idx = attention_mask.sum(dim=1).long() - 1
+                gen_logits = logits[torch.arange(logits.size(0), device=logits.device), gen_idx, self.config.token_list] # (B, Tok_list)
+
+                loss_kwargs["num_items_in_batch"] = None
+                loss = ForTokenClassification(logits=gen_logits, labels=labels, config=self.config, **loss_kwargs)
+            else:
+                raise ValueError(f"{self.config.loss_type} is not implemented or missing config arguments")
 
         return CausalLMOutput(
             loss=loss,
