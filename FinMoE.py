@@ -50,8 +50,8 @@ class Top1Gating(nn.Module):
     
     def forward(self,
                 input_ids: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None,
-                use_aux_loss: bool = False) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+                attention_mask: Optional[torch.Tensor] = None
+        ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Computes the forward pass of the gating network
 
@@ -83,18 +83,7 @@ class Top1Gating(nn.Module):
         # Norm gate scores to sum to 1
         norm_gate_scores = masked_gate_scores / denominators
 
-        # if use_aux_loss:
-        #     print(gate_scores.shape)
-        #     print(gate_scores)
-        #     load = gate_scores.sum(0)  # Sum over all examples
-        #     importance = gate_scores.sum(1)  # Sum over all experts
-
-        #     # Aux loss is mean suqared difference between load and importance
-        #     aux_loss = ((load - importance) ** 2).mean()
-
-        #     return gate_scores, top1_indices.squeeze(-1), aux_loss
-
-        return norm_gate_scores, top1_indices, None
+        return norm_gate_scores, top1_indices
 
 
     def save_pretrained(self, save_directory: str, **__):
@@ -156,8 +145,7 @@ class FinMoE(PreTrainedModel):
         **loss_kwargs
     ):
         ## expert routing produces gate scores
-        use_aux_loss = labels is not None
-        gate_scores, top1_indices, aux_loss = self.gate.forward(input_ids, attention_mask, use_aux_loss)  # (B, E)
+        gate_scores, top1_indices = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
         combined_output = torch.zeros(input_ids.shape + (self.vocab_size, ),
                                       dtype=self.config.torch_dtype,
@@ -190,10 +178,8 @@ class FinMoE(PreTrainedModel):
 
                 gen_logits = logits[batch_indices[:, None], gen_idx[:, None], self.config.token_list] # (B, Tok_list)
 
-                loss_kwargs["num_items_in_batch"] = None
+                loss_kwargs["num_items_in_batch"] = None ## default = 0, causing ZeroDivisionError
                 loss = ForTokenClassification(logits=gen_logits, labels=labels, config=self.config, **loss_kwargs)
-                # if use_aux_loss:
-                #     loss += aux_loss
 
             else:
                 raise ValueError(f"{self.config.loss_type} is not implemented or missing config arguments")

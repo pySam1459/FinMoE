@@ -5,3 +5,4 @@ __pycache__/
 scores-*.txt
 
 FinMoE.ipynb
+visualise.ipynb
