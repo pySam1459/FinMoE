@@ -30,7 +30,7 @@ class FinMoEConfig(PretrainedConfig):
         self.token_list = kwargs.pop("token_list", None)
 
 
-class Top1Gating(nn.Module):
+class Top3Gating(nn.Module):
     """
     Gating network using a llama model for natural language feature extraction
       with a `w_gate` head for expert classification.
@@ -40,7 +40,7 @@ class Top1Gating(nn.Module):
         num_experts (int): number of expert models `w_gate` should project to
     """
     def __init__(self, config: FinMoEConfig, llama: LlamaModel):
-        super(Top1Gating, self).__init__()
+        super(Top3Gating, self).__init__()
 
         self.llama = llama
         self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
@@ -98,9 +98,9 @@ class Top1Gating(nn.Module):
 class FinMoE(PreTrainedModel):
     """
     Finance Mixture of Experts
-
+    LlamaForCausalLM is loaded, PeftModel made with expert adapters applied and all weights are frozen
+    Top3Gating module is initialised with frozen base llama model
     """
-
     config_class = FinMoEConfig
 
     def __init__(self, config: FinMoEConfig):
@@ -109,20 +109,20 @@ class FinMoE(PreTrainedModel):
         ## load base_model
         llama = LlamaForCausalLM.from_pretrained(config.model_id, torch_dtype=config.torch_dtype)
 
-        ## Load LoRA adapters onto PeftModel
+        ## Load LoRA adapters onto new PeftModel
         self.n_experts = len(config.expert_ckpts)
         self.expert = PeftModel.from_pretrained(llama, config.expert_ckpts[0], adapter_name="0")
         for i, ckpt in enumerate(config.expert_ckpts[1:], start=1):
             self.expert.load_adapter(ckpt, adapter_name=str(i))
 
-        # freeze base model and LoRA adapter params
+        ## freeze base model and LoRA adapter params
         for param in self.expert.parameters(): 
             param.requires_grad = False
 
-        ## pass frozen LlamaModel to Top1Gating
-        self.gate = Top1Gating(config, llama.model)
+        ## pass frozen LlamaModel to Top3Gating
+        self.gate = Top3Gating(config, llama.model)
 
-        self.vocab_size = self.expert.config.vocab_size
+        self.vocab_size = self.expert.config.vocab_size # V
     
     def forward(
         self,
@@ -143,7 +143,8 @@ class FinMoE(PreTrainedModel):
         for expert_idx in range(self.n_experts):
             self.expert.set_adapter(str(expert_idx))
 
-            expert_out = self.expert(input_ids, attention_mask)
+            ## pass inputs through expert and multiple by gating scores
+            expert_out = self.expert(input_ids, attention_mask) # (B, T, V)
             logits += expert_out.logits * gate_scores[:, expert_idx].view(batch_size, 1, 1)
 
         loss = None
@@ -169,11 +170,6 @@ class FinMoE(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
-    
-    def predict(self,
-                input_ids: Optional[torch.LongTensor] = None,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        ...
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
