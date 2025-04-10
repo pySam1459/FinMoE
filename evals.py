@@ -148,8 +148,8 @@ def evaluate_FinMoE(model: FinMoE,
         input_ids = torch.tensor(example["input_ids"]).to(model.device)
         attn_mask = torch.tensor(example["attention_mask"]).to(model.device)
 
-        _, top1_indices = model.gate.forward(input_ids=input_ids, attention_mask=attn_mask)
-        gating_routes[i] = top1_indices.item()
+        gate_scores = model.gate.forward(input_ids=input_ids, attention_mask=attn_mask)
+        gating_routes[i] = torch.argmax(gate_scores, dim=-1).item()
 
     ## Once routes have been computed, group dataset samples
     indices = {expert_idx: [] for expert_idx in range(model.n_experts)}

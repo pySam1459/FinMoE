@@ -43,10 +43,9 @@ class Top1Gating(nn.Module):
         super(Top1Gating, self).__init__()
 
         self.llama = llama
-        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts) # (C, E)
+        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
 
         self.gaussian = config.gating_gaussian
-        self.epsilon = 1e-6 # stops ZeroDivisionError when div by denominators
     
     def forward(self,
                 input_ids: torch.Tensor,
@@ -61,29 +60,17 @@ class Top1Gating(nn.Module):
         
         Returns:
             gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
-            top1_indices (Tensor): top 1 expert indices for each sample in batch, size (B,)
         """
         outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = outputs.last_hidden_state[:, 0, :]
-
-        gate_scores = self.w_gate(pooled)  # (B, E)
-        if self.training:
-            gate_scores += torch.randn_like(gate_scores) * self.gaussian
-
-        _, top1_indices = gate_scores.topk(1, dim=-1)
+        logits = self.w_gate(outputs.last_hidden_state)# (B, T, E)
         
-        ## below contains tricks to make gate_scores differentiable
-        ## see: https://github.com/kyegomez/SwitchTransformers/blob/main/switch_transformers/model.py
-        mask = torch.zeros_like(gate_scores).scatter_(
-            1, top1_indices, 1
-        )
-        masked_gate_scores = gate_scores * mask
-        denominators = masked_gate_scores.sum(-1, keepdim=True) + self.epsilon
-        
-        # Norm gate scores to sum to 1
-        norm_gate_scores = masked_gate_scores / denominators
+        batch_size = input_ids.shape[0]
+        gen_idx = attention_mask.sum(dim=1).long() - 1
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
+        # if self.training:
+        #     gate_scores += torch.randn_like(gate_scores) * self.gaussian
 
-        return norm_gate_scores, top1_indices
+        return torch.softmax(pooled_logits, dim=-1)
 
 
     def save_pretrained(self, save_directory: str, **__):
@@ -145,27 +132,19 @@ class FinMoE(PreTrainedModel):
         **loss_kwargs
     ):
         ## expert routing produces gate scores
-        gate_scores, top1_indices = self.gate.forward(input_ids, attention_mask)  # (B, E)
+        gate_scores = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
-        combined_output = torch.zeros(input_ids.shape + (self.vocab_size, ),
-                                      dtype=self.config.torch_dtype,
-                                      device=self.device)
+        logits = torch.zeros(input_ids.shape + (self.vocab_size, ),
+                             dtype=self.config.torch_dtype,
+                             device=self.device)
         
-        batch_size = input_ids.size(0)
         # For each expert, process only the samples routed to it.
+        batch_size = input_ids.size(0)
         for expert_idx in range(self.n_experts):
-            mask = (top1_indices.squeeze(1) == expert_idx) # mask over batches
-            if not mask.any():
-                continue
-
-            selected_input_ids = input_ids[mask]
-            selected_attention = attention_mask[mask] if attention_mask is not None else None
-
             self.expert.set_adapter(str(expert_idx))
-            expert_out = self.expert(selected_input_ids, selected_attention)
-            combined_output[mask] = expert_out.logits
 
-        logits = combined_output * gate_scores.gather(1, top1_indices).unsqueeze(-1)
+            expert_out = self.expert(input_ids, attention_mask)
+            logits += expert_out.logits * gate_scores[:, expert_idx].view(batch_size, 1, 1)
 
         loss = None
         if labels is not None:
@@ -190,6 +169,11 @@ class FinMoE(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
+    
+    def predict(self,
+                input_ids: Optional[torch.LongTensor] = None,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        ...
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
