@@ -83,6 +83,7 @@ def load_eval_dataset(tokenizer: PreTrainedTokenizer,
         raise ValueError("Invalid dataset id. Only FPB, Headline, Topics")
 
 
+@torch.no_grad()
 def evaluate(model: PreTrainedModel,
              tokenizer: PreTrainedTokenizer,
              testset: Dataset,
@@ -134,6 +135,7 @@ def evaluate(model: PreTrainedModel,
     }
 
 
+@torch.no_grad()
 def evaluate_FinMoE(model: FinMoE,
                     tokenizer: PreTrainedTokenizer,
                     testset: Dataset,
@@ -141,6 +143,15 @@ def evaluate_FinMoE(model: FinMoE,
     """
     Modified evaluate function to minimise the switching of adapters, speeds to eval times
       by pre-computed the routes for each sample in the dataset and grouping samples by expert route
+    
+    Args:
+        model (FinMoE): FinMoE model object to be evaluated
+        tokenizer (PreTrainedTokenizer): model tokenizer from transformers library
+        testset (Dataset): test examples in a datasets.Dataset
+        token_opts (list[int]): a list of token values
+    
+    Returns:
+        dict[str, float]: a mapping of metric information
     """
     gating_progbar = tqdm(testset, desc="Routing experts")
     gating_routes = torch.empty(len(testset), dtype=torch.long, device=model.device)
@@ -168,6 +179,7 @@ def evaluate_FinMoE(model: FinMoE,
     for expert_idx, subset in subsets.items():
         model.expert.set_adapter(str(expert_idx))
 
+        ## run expert `expert_idx` on test subset
         for example in subset:
             input_ids = torch.tensor(example["input_ids"])
             attn_mask = torch.tensor(example["attention_mask"])
@@ -193,4 +205,73 @@ def evaluate_FinMoE(model: FinMoE,
         "accuracy": correct / total,
         "n_correct": correct,
         "n_total": total,
+    }
+
+
+@torch.no_grad()
+def evaluate_FinMoE_weighted(model: FinMoE,
+                             testset: Dataset,
+                             dataset_id: str,
+                             args: DatasetArgs)  -> dict[str, float]:
+    """
+    Evaluates FinMoE with a weighted sum of expert answers, weighted by gate_scores
+    
+    Args:
+        model (FinMoE): FinMoE model object to be evaluated
+        tokenizer (PreTrainedTokenizer): model tokenizer from transformers library
+        testset (Dataset): test examples in a datasets.Dataset
+        token_opts (list[int]): a list of token values
+    
+    Returns:
+        dict[str, float]: a mapping of metric information
+    """
+    n_samples = len(testset)
+    token_opts = args.token_opts[dataset_id]
+
+    labels_mapping = {label.strip(" "): i for i, label in enumerate(args.labels_list)}
+    labels = torch.empty((n_samples,), dtype=torch.long)
+
+    gate_scores = torch.empty((n_samples, model.config.n_experts),
+                              dtype=model.config.torch_dtype,
+                              device=model.device)
+    for i, example in enumerate(tqdm(testset, desc="Routing experts")):
+        input_ids = torch.tensor(example["input_ids"]).to(model.device)
+        attn_mask = torch.tensor(example["attention_mask"]).to(model.device)
+
+        gate_scores[i] = model.gate.forward(input_ids=input_ids, attention_mask=attn_mask)
+
+        ## compute label indices overlabels_list for testset
+        label = example["options"][example["gold_index"]]
+        labels[i] = labels_mapping[label]
+
+    ## Evaluation starts here
+    gate_scores = gate_scores.cpu()
+    logits = torch.zeros((n_samples, len(token_opts)), dtype=torch.float16)
+
+    prog_bar = tqdm(total=n_samples*3, desc="Evaluating")
+    for expert_idx in range(model.config.n_experts):
+        model.expert.set_adapter(str(expert_idx))
+
+        ## run expert `expert_idx` on test subset
+        for i, example in enumerate(testset):
+            input_ids = torch.tensor(example["input_ids"]).to(model.device)
+            attn_mask = torch.tensor(example["attention_mask"]).to(model.device)
+            gen_idx = attn_mask.sum(dim=1).long() - 1
+
+            out = model.expert.forward(input_ids=input_ids,
+                                       attention_mask=attn_mask)
+
+            # weight expert's output by gating scores
+            batch_logits = out.logits[0, gen_idx, token_opts].cpu() 
+            logits[i] += torch.softmax(batch_logits, dim=-1) * gate_scores[i, expert_idx] 
+
+            prog_bar.update(1)
+    
+    predictions = torch.argmax(logits, dim=-1)
+    correct = (predictions == labels).sum().item()
+
+    return {
+        "accuracy": correct / n_samples,
+        "n_correct": correct,
+        "n_total": n_samples,
     }
