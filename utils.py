@@ -6,6 +6,8 @@ from typing import Any
 
 @dataclass
 class DatasetArgs:
+    expert_order: list[str]
+
     prompt_templates: dict[str, str]
     prompt_args: dict[str, list[str]]
 
@@ -14,8 +16,10 @@ class DatasetArgs:
     del_mapping: dict[str, str | None]
     names_mapping: dict[str, list[str] | None]
 
-    id2labels: dict[str, dict[Any, str]]
     topics: list[str]
+    id2labels: dict[str, dict[Any, str]]
+    labels_list: list[str]
+
     token_opts: dict[str, list[int]]
     token_list: list[int]
 
@@ -37,17 +41,30 @@ def get_dataset_args(tokenizer: PreTrainedTokenizer, hub_basepath: Path) -> Data
     topics = ['Analyst Update', 'Fed | Central Banks', 'Company | Product News', 'Treasuries | Corporate Debt', 'Dividend', 'Earnings', 'Energy | Oil', 'Financials', 'Currencies', 'General News | Opinion', 'Gold | Metals | Materials', 'IPO', 'Legal | Regulation', 'M&A | Investments', 'Macro', 'Markets', 'Politics', 'Personnel Change', 'Stock Commentary', 'Stock Movement']
     topic_options = "\n".join([f"{i} - {t}" for i, t in enumerate(topics)])
 
-    id2labels = {
+    expert_order = ["FPB", "Headline", "Topics"]
+
+    id2labels = dict[str, dict[Any, str]]({
         "FPB": {"neutral": " Neutral", "positive": " Positive", "negative": " Negative"},
         "Headline": {0: " No", 1: " Yes"},
         "Topics": {i: str(i) for i in range(20)},
+    })
+
+    ## used to ensure order of token_list
+    id2labels_ordered = {
+        did: list(labels.values()) for did, labels in id2labels.items()
     }
+    labels_list = [label for did in expert_order for label in id2labels_ordered[did]]
+
     token_opts = {
-        did: [tokenizer.encode(v, add_special_tokens=False)[0] for v in labels.values()]
-        for did, labels in id2labels.items()
+        did: [tokenizer.encode(v, add_special_tokens=False)[0] for v in id2labels_ordered[did]]
+        for did in expert_order
     }
+    token_list = [token for did in expert_order for token in token_opts[did]]
+    
 
     return DatasetArgs(
+        expert_order = expert_order,
+
         prompt_templates = {
             "FPB": "{0}\nQuestion: what is the sentiment?\nOptions:\n- Positive\n- Negative\n- Neutral",
             "Headline": "Headline: \"{0}\" Now answer this question: {1}",
@@ -80,8 +97,11 @@ def get_dataset_args(tokenizer: PreTrainedTokenizer, hub_basepath: Path) -> Data
             "Topics": ["label", "text"]
         },
 
-        id2labels = id2labels,
         topics = topics,
+
+        id2labels = id2labels,
+        labels_list = labels_list,
+
         token_opts = token_opts,
-        token_list = [v for tok_labels in token_opts.values() for v in tok_labels],
+        token_list = token_list,
     )

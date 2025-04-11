@@ -50,7 +50,7 @@ class Top3Gating(nn.Module):
     def forward(self,
                 input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None
-        ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        ) -> torch.Tensor:
         """
         Computes the forward pass of the gating network
 
@@ -67,8 +67,8 @@ class Top3Gating(nn.Module):
         batch_size = input_ids.shape[0]
         gen_idx = attention_mask.sum(dim=1).long() - 1
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
-        # if self.training:
-        #     gate_scores += torch.randn_like(gate_scores) * self.gaussian
+        if self.training and self.gaussian > 0:
+            gate_scores += torch.randn_like(gate_scores) * self.gaussian
 
         return torch.softmax(pooled_logits, dim=-1)
 
