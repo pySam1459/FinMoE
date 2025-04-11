@@ -68,7 +68,7 @@ class Top3Gating(nn.Module):
         gen_idx = attention_mask.sum(dim=1).long() - 1
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
         if self.training and self.gaussian > 0:
-            gate_scores += torch.randn_like(gate_scores) * self.gaussian
+            pooled_logits += torch.randn_like(pooled_logits) * self.gaussian
 
         return torch.softmax(pooled_logits, dim=-1)
 
