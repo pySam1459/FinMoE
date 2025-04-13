@@ -43,7 +43,7 @@ class Top1Gating(nn.Module):
         super(Top1Gating, self).__init__()
 
         self.llama = llama
-        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts) # (C, E)
+        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
 
         self.gaussian = config.gating_gaussian
         self.epsilon = 1e-6 # stops ZeroDivisionError when div by denominators
@@ -64,10 +64,13 @@ class Top1Gating(nn.Module):
             top1_indices (Tensor): top 1 expert indices for each sample in batch, size (B,)
         """
         outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = outputs.last_hidden_state[:, 0, :]
+        logits = self.w_gate(outputs.last_hidden_state)# (B, T, E)
+        
+        batch_size = input_ids.shape[0]
+        gen_idx = attention_mask.sum(dim=1).long() - 1
+        gate_scores = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
 
-        gate_scores = self.w_gate(pooled)  # (B, E)
-        if self.training:
+        if self.training and self.gaussian > 0:
             gate_scores += torch.randn_like(gate_scores) * self.gaussian
 
         _, top1_indices = gate_scores.topk(1, dim=-1)
