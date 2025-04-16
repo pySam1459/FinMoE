@@ -17,6 +17,7 @@ class FinMoEConfig(PretrainedConfig):
     Kwargs:
         expert_ckpts (list[str]): a list of str paths to expert model checkpoints to be used in FinMoE
         model_id (str): huggingface model id used to load from remote repo
+        g_net_id (str): Name of gating subclass to use
         token_list (list[int] | None): token indices used for ForTokenClassification loss
     """
     def __init__(self, **kwargs):
@@ -24,54 +25,22 @@ class FinMoEConfig(PretrainedConfig):
 
         self.expert_ckpts = kwargs.pop("expert_ckpts", [])
         self.n_experts = len(self.expert_ckpts)
+
         self.model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-1B")
-        self.gating_gaussian = kwargs.pop("gating_gaussian", 0.2)
+        self.g_net_id = kwargs.pop("g_net_id", "LlamaGating")
 
         self.token_list = kwargs.pop("token_list", None)
 
 
-class Top3Gating(nn.Module):
+class GatingBase(nn.Module):
     """
-    Gating network using a llama model for natural language feature extraction
-      with a `w_gate` head for expert classification.
-
-    Args:
-        llama (LlamaModel): base llama model reference
-        num_experts (int): number of expert models `w_gate` should project to
+    Base class for the different Gating Network variants
     """
-    def __init__(self, config: FinMoEConfig, llama: LlamaModel):
-        super(Top3Gating, self).__init__()
-
-        self.llama = llama
-        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
-
-        self.gaussian = config.gating_gaussian
-    
     def forward(self,
                 input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
-        """
-        Computes the forward pass of the gating network
-
-        Args:
-            input_ids (Tensor): tensor of input tokens ids
-            attention_mask (Tensor): tensor of attention mask, used when batch contains different length input tokens
-        
-        Returns:
-            gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
-        """
-        outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        logits = self.w_gate(outputs.last_hidden_state)# (B, T, E)
-        
-        batch_size = input_ids.shape[0]
-        gen_idx = attention_mask.sum(dim=1).long() - 1
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
-        if self.training and self.gaussian > 0:
-            pooled_logits += torch.randn_like(pooled_logits) * self.gaussian
-
-        return torch.softmax(pooled_logits, dim=-1)
-
+        ...
 
     def save_pretrained(self, save_directory: str, **__):
         os.makedirs(save_directory, exist_ok=True)
@@ -95,6 +64,93 @@ class Top3Gating(nn.Module):
             raise FileNotFoundError(f"No trainable checkpoint found at {load_path}")
 
 
+class FastGating(GatingBase):
+    """
+    Gating network using LogSumExp over Llama model input embeddings for natural language feature extraction
+      with a `w_gate` head for expert classification.
+
+    Args:
+        llama (LlamaModel): base llama model reference
+        num_experts (int): number of expert models `w_gate` should project to
+    """
+    def __init__(self, config: FinMoEConfig, llama: LlamaModel):
+        super(FastGating, self).__init__()
+
+        self.embed_tokens = llama.embed_tokens
+        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
+
+        self.temperature = 1.0
+    
+    def forward(self,
+                input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+        """
+        Computes the forward pass of the FastGating network
+
+        Args:
+            input_ids (Tensor): tensor of input tokens ids
+            attention_mask (Tensor): tensor of attention mask, used when batch contains different length input tokens
+        
+        Returns:
+            gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
+        """
+        ## compute logits using llama embeddings and w_gate
+        embds = self.embed_tokens(input_ids) # (B, T, C)
+        logits = self.w_gate(embds) # (B, T, E)
+
+        ## fix to RuntimeError caused by in-place operations modifying variables needed for gradient computations
+        logits_scaled = logits / self.temperature
+
+        ## mask out logits
+        mask_expanded = attention_mask.bool().unsqueeze(-1)
+        logits_scaled_masked = logits_scaled.masked_fill(~mask_expanded, float('-inf')) # (B, T, E)
+
+        pooled_logits = self.temperature * torch.logsumexp(logits_scaled_masked, dim=1) # (B, E)
+        return torch.softmax(pooled_logits, dim=-1)
+
+
+class LlamaGating(GatingBase):
+    """
+    Gating network using a llama model for natural language feature extraction
+      with a `w_gate` head for expert classification.
+
+    Args:
+        llama (LlamaModel): base llama model reference
+        num_experts (int): number of expert models `w_gate` should project to
+    """
+    def __init__(self, config: FinMoEConfig, llama: LlamaModel):
+        super(LlamaGating, self).__init__()
+
+        self.llama = llama
+        self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
+    
+    def forward(self,
+                input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+        """
+        Computes the forward pass of the LlamaGating network
+
+        Args:
+            input_ids (Tensor): tensor of input tokens ids
+            attention_mask (Tensor): tensor of attention mask, used when batch contains different length input tokens
+        
+        Returns:
+            gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
+        """
+        ## compute logits using llama forward pass and w_gate
+        outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
+        logits = self.w_gate(outputs.last_hidden_state) # (B, T, E)
+
+        ## select logit repr'ing token to be generated, across batch
+        batch_size = input_ids.shape[0]
+        gen_idx = attention_mask.sum(dim=1).long() - 1  # index of token to be generated
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
+
+        return torch.softmax(pooled_logits, dim=-1)
+
+
 class FinMoE(PreTrainedModel):
     """
     Finance Mixture of Experts
@@ -102,6 +158,10 @@ class FinMoE(PreTrainedModel):
     Top3Gating module is initialised with frozen base llama model
     """
     config_class = FinMoEConfig
+    gating_networks = dict[str, GatingBase]({
+        "FastGating": FastGating,
+        "LlamaGating": LlamaGating
+    })
 
     def __init__(self, config: FinMoEConfig):
         super(FinMoE, self).__init__(config)
@@ -110,7 +170,7 @@ class FinMoE(PreTrainedModel):
         llama = LlamaForCausalLM.from_pretrained(config.model_id, torch_dtype=config.torch_dtype)
 
         ## Load LoRA adapters onto new PeftModel
-        self.n_experts = len(config.expert_ckpts)
+        self.n_experts = config.n_experts
         self.expert = PeftModel.from_pretrained(llama, config.expert_ckpts[0], adapter_name="0")
         for i, ckpt in enumerate(config.expert_ckpts[1:], start=1):
             self.expert.load_adapter(ckpt, adapter_name=str(i))
@@ -120,7 +180,11 @@ class FinMoE(PreTrainedModel):
             param.requires_grad = False
 
         ## pass frozen LlamaModel to Top3Gating
-        self.gate = Top3Gating(config, llama.model)
+        if config.g_net_id in FinMoE.gating_networks:
+            self.gate = FinMoE.gating_networks[config.g_net_id](config, llama.model)
+        else:
+            avail_networks = ", ".join(FinMoE.gating_networks.keys())
+            raise TypeError(f"FinMoEConfig g_net_id {config.g_net_id} is invalid. Available gating networks: {avail_networks}")
 
         self.vocab_size = self.expert.config.vocab_size # V
     
