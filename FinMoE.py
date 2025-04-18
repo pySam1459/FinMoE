@@ -1,3 +1,6 @@
+# FinMoE implementation by Samuel Barnett
+# Submitted as part of the degree of MEng Computer Science 
+#   to the Board of Examiners in the Department of Computer Sciences, Durham University
 import os
 import torch
 import torch.nn as nn
@@ -36,6 +39,7 @@ class FinMoEConfig(PretrainedConfig):
 class GatingBase(nn.Module):
     """
     Base class for the different Gating Network variants
+    Includes methods `save_pretrained` and `load_pretrained`
     """
     def forward(self,
                 input_ids: torch.Tensor,
@@ -92,18 +96,17 @@ class FastGating(GatingBase):
         Args:
             input_ids (Tensor): tensor of input tokens ids
             attention_mask (Tensor): tensor of attention mask, used when batch contains different length input tokens
-        
         Returns:
             gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
         """
-        ## compute logits using llama embeddings and w_gate
+        # compute logits using llama embeddings and w_gate
         embds = self.embed_tokens(input_ids) # (B, T, C)
         logits = self.w_gate(embds) # (B, T, E)
 
-        ## fix to RuntimeError caused by in-place operations modifying variables needed for gradient computations
+        # fix to RuntimeError caused by in-place operations modifying variables needed for gradient computations
         logits_scaled = logits / self.temperature
 
-        ## mask out logits
+        # mask out logits
         mask_expanded = attention_mask.bool().unsqueeze(-1)
         logits_scaled_masked = logits_scaled.masked_fill(~mask_expanded, float('-inf')) # (B, T, E)
 
@@ -140,11 +143,11 @@ class LlamaGating(GatingBase):
         Returns:
             gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
         """
-        ## compute logits using llama forward pass and w_gate
+        # compute logits using llama forward pass and w_gate
         outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
         logits = self.w_gate(outputs.last_hidden_state) # (B, T, E)
 
-        ## select logit repr'ing token to be generated, across batch
+        # select logit repr'ing token to be generated, across batch
         batch_size = input_ids.shape[0]
         gen_idx = attention_mask.sum(dim=1).long() - 1  # index of token to be generated
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), gen_idx] # (B, E)
@@ -153,11 +156,8 @@ class LlamaGating(GatingBase):
 
 
 class FinMoE(PreTrainedModel):
-    """
-    Finance Mixture of Experts
-    LlamaForCausalLM is loaded, PeftModel made with expert adapters applied and all weights are frozen
-    Top3Gating module is initialised with frozen base llama model
-    """
+    """Mixture of Experts Finance Language Model"""
+
     config_class = FinMoEConfig
     gating_networks = dict[str, GatingBase]({
         "FastGating": FastGating,
@@ -167,27 +167,27 @@ class FinMoE(PreTrainedModel):
     def __init__(self, config: FinMoEConfig):
         super(FinMoE, self).__init__(config)
 
-        ## load base_model
+        # load base_model
         llama = LlamaForCausalLM.from_pretrained(config.model_id, torch_dtype=config.torch_dtype)
 
-        ## Load LoRA adapters onto new PeftModel
+        # Load LoRA adapters onto new PeftModel
         self.n_experts = config.n_experts
         self.expert = PeftModel.from_pretrained(llama, config.expert_ckpts[0], adapter_name="0")
         for i, ckpt in enumerate(config.expert_ckpts[1:], start=1):
             self.expert.load_adapter(ckpt, adapter_name=str(i))
 
-        ## freeze base model and LoRA adapter params
+        # freeze base model and LoRA adapter params
         for param in self.expert.parameters(): 
             param.requires_grad = False
 
-        ## pass frozen LlamaModel to Top3Gating
+        # pass frozen LlamaModel to Top3Gating
         if config.g_net_id in FinMoE.gating_networks:
             self.gate = FinMoE.gating_networks[config.g_net_id](config, llama.model)
         else:
             avail_networks = ", ".join(FinMoE.gating_networks.keys())
             raise ValueError(f"FinMoEConfig g_net_id {config.g_net_id} is invalid. Available gating networks: {avail_networks}")
 
-        ## pre-determine topk expert selection function
+        # pre-determine topk expert selection function
         if config.topk == "top1":
             self._expert_loop = self._expert_loop_top1
         elif config.topk == "top3":
@@ -196,7 +196,7 @@ class FinMoE(PreTrainedModel):
             raise ValueError(f"FinMoEConfig topk {config.topk} is invalid. Avaialble topk: top1, top3")
 
         self.vocab_size = self.expert.config.vocab_size # V
-        self.epsilon = 1e-6 # stops ZeroDivisionError when div by denominators
+        self.epsilon = 1e-6 # stops ZeroDivisionError when div by denominators, used in top1 loop
     
     def forward(
         self,
@@ -214,30 +214,16 @@ class FinMoE(PreTrainedModel):
             attention_mask (Tensor | None): used to mask padding tokens when batch training with samples of different lengths
             labels (Tensor | None): 
         """
-        ## expert routing produces gate scores
+        # expert routing produces gate scores
         gate_scores = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
+        # compute logits via top-1 or top-3 expert loops
         logits = self._expert_loop(gate_scores, input_ids, attention_mask)
 
         loss = None
         if labels is not None:
-            if self.config.loss_type == "ForCausalLM":
-                loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
-
-            elif self.config.loss_type == "ForTokenClassification" and self.config.token_list is not None:
-                if attention_mask is None:
-                    raise ValueError("Attention mask is required to select last token in sequence")
-
-                gen_idx = attention_mask.sum(dim=1).long() - 1
-                batch_indices = torch.arange(logits.size(0), device=logits.device)
-
-                gen_logits = logits[batch_indices[:, None], gen_idx[:, None], self.config.token_list] # (B, Tok_list)
-
-                loss_kwargs["num_items_in_batch"] = None ## default = 0, causing ZeroDivisionError
-                loss = ForTokenClassification(logits=gen_logits, labels=labels, config=self.config, **loss_kwargs)
-
-            else:
-                raise ValueError(f"{self.config.loss_type} is not implemented or missing config arguments")
+            # Compute loss if labels are provided
+            loss = self._compute_loss(logits, labels, attention_mask, **loss_kwargs)
 
         return CausalLMOutput(
             loss=loss,
@@ -268,7 +254,7 @@ class FinMoE(PreTrainedModel):
         for expert_idx in range(self.n_experts):
             self.expert.set_adapter(str(expert_idx))
 
-            ## pass inputs through expert and multiple by gating scores
+            # pass inputs through expert and multiple by gating scores
             expert_out = self.expert(input_ids, attention_mask) # (B, T, V)
             logits += expert_out.logits * gate_scores[:, expert_idx].view(batch_size, 1, 1)
         
@@ -322,6 +308,35 @@ class FinMoE(PreTrainedModel):
         # logits = combined_outputs with gate_scores connection
         return combined_output * norm_gate_scores.gather(1, top1_indices).unsqueeze(-1)
 
+    def _compute_loss(self,
+                      logits: torch.FloatTensor,
+                      labels: torch.LongTensor,
+                      attention_mask: Optional[torch.Tensor],
+                      **loss_kwargs) -> torch.Tensor:
+        """
+        Computes the loss for CausalLM or TokenClassificatoin
+        """
+        if self.config.loss_type == "ForCausalLM":
+            return ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
+
+        elif self.config.loss_type == "ForTokenClassification" and self.config.token_list is not None:
+            if attention_mask is None:
+                raise ValueError("Attention mask is required to select last token in sequence")
+
+            # select last token index in input sequence
+            gen_idx = attention_mask.sum(dim=1).long() - 1
+            batch_indices = torch.arange(logits.size(0), device=logits.device)
+
+            # (B, T, V) -> (B, Tok_list)
+            # T dim is squeezed by indexing to the last token `gen_idx`
+            # Tokens from `self.config.token_list` are selected from V dim
+            gen_logits = logits[batch_indices[:, None], gen_idx[:, None], self.config.token_list] # (B, Tok_list)
+
+            loss_kwargs["num_items_in_batch"] = None ## default = 0, causing ZeroDivisionError
+            return ForTokenClassification(logits=gen_logits, labels=labels, config=self.config, **loss_kwargs)
+
+        else:
+            raise ValueError(f"{self.config.loss_type} is not implemented or missing config arguments")
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
