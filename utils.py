@@ -23,7 +23,7 @@ class DatasetArgs:
     token_opts: dict[str, list[int]]
     token_list: list[int]
 
-    max_length: int = 512
+    max_length: int = 256
 
 
 def get_adaptllm_path(base_path: Path) -> Path:

@@ -1,0 +1,6 @@
+datasets
+huggingface_hub
+pandas
+peft
+tqdm
+transformers
