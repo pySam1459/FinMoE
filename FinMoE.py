@@ -28,6 +28,7 @@ class FinMoEConfig(PretrainedConfig):
 
         self.model_id = kwargs.pop("model_id", "meta-llama/Llama-3.2-1B")
         self.g_net_id = kwargs.pop("g_net_id", "LlamaGating")
+        self.topk = kwargs.pop("topk", "top3")
 
         self.token_list = kwargs.pop("token_list", None)
 
@@ -184,32 +185,39 @@ class FinMoE(PreTrainedModel):
             self.gate = FinMoE.gating_networks[config.g_net_id](config, llama.model)
         else:
             avail_networks = ", ".join(FinMoE.gating_networks.keys())
-            raise TypeError(f"FinMoEConfig g_net_id {config.g_net_id} is invalid. Available gating networks: {avail_networks}")
+            raise ValueError(f"FinMoEConfig g_net_id {config.g_net_id} is invalid. Available gating networks: {avail_networks}")
+
+        ## pre-determine topk expert selection function
+        if config.topk == "top1":
+            self._expert_loop = self._expert_loop_top1
+        elif config.topk == "top3":
+            self._expert_loop = self._expert_loop_top3
+        else:
+            raise ValueError(f"FinMoEConfig topk {config.topk} is invalid. Avaialble topk: top1, top3")
 
         self.vocab_size = self.expert.config.vocab_size # V
+        self.epsilon = 1e-6 # stops ZeroDivisionError when div by denominators
     
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         **loss_kwargs
     ):
+        """
+        Computes the logits using top-3 expert selection.
+        Output is computed from all experts and weighted by gate_scores to produce output logits
+
+        Args:
+            input_ids (Tensor): input sequence of token ids
+            attention_mask (Tensor | None): used to mask padding tokens when batch training with samples of different lengths
+            labels (Tensor | None): 
+        """
         ## expert routing produces gate scores
         gate_scores = self.gate.forward(input_ids, attention_mask)  # (B, E)
 
-        logits = torch.zeros(input_ids.shape + (self.vocab_size, ),
-                             dtype=self.config.torch_dtype,
-                             device=self.device)
-        
-        # For each expert, process only the samples routed to it.
-        batch_size = input_ids.size(0)
-        for expert_idx in range(self.n_experts):
-            self.expert.set_adapter(str(expert_idx))
-
-            ## pass inputs through expert and multiple by gating scores
-            expert_out = self.expert(input_ids, attention_mask) # (B, T, V)
-            logits += expert_out.logits * gate_scores[:, expert_idx].view(batch_size, 1, 1)
+        logits = self._expert_loop(gate_scores, input_ids, attention_mask)
 
         loss = None
         if labels is not None:
@@ -217,6 +225,9 @@ class FinMoE(PreTrainedModel):
                 loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)
 
             elif self.config.loss_type == "ForTokenClassification" and self.config.token_list is not None:
+                if attention_mask is None:
+                    raise ValueError("Attention mask is required to select last token in sequence")
+
                 gen_idx = attention_mask.sum(dim=1).long() - 1
                 batch_indices = torch.arange(logits.size(0), device=logits.device)
 
@@ -234,6 +245,83 @@ class FinMoE(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
+    
+    def _expert_loop_top3(self,
+                          gate_scores: torch.FloatTensor,
+                          input_ids: torch.LongTensor,
+                          attention_mask: Optional[torch.Tensor]) -> torch.FloatTensor:
+        """
+        Computes the logits using top-3 expert selection.
+        Output is computed from all experts and weighted by gate_scores to produce output logits
+
+        Args:
+            gate_scores (Tensor): probability distribution computed by gating network for expert routes
+            input_ids (Tensor): input sequence of token ids
+            attention_mask (Tensor): used to mask padding tokens when batch training with samples of different lengths
+        """
+        logits = torch.zeros(input_ids.shape + (self.vocab_size, ),
+                             dtype=self.config.torch_dtype,
+                             device=self.device)
+        
+        # For each expert, process only the samples routed to it.
+        batch_size = input_ids.size(0)
+        for expert_idx in range(self.n_experts):
+            self.expert.set_adapter(str(expert_idx))
+
+            ## pass inputs through expert and multiple by gating scores
+            expert_out = self.expert(input_ids, attention_mask) # (B, T, V)
+            logits += expert_out.logits * gate_scores[:, expert_idx].view(batch_size, 1, 1)
+        
+        return logits
+    
+    def _expert_loop_top1(self,
+                          gate_scores: torch.FloatTensor,
+                          input_ids: torch.LongTensor,
+                          attention_mask: Optional[torch.Tensor]) -> None:
+        """
+        Computes the logits using top-1 expert selection.
+        Output is computed by selecting the expert with the maximum gate score, and returning its output.
+
+        Args:
+            gate_scores (Tensor): probability distribution computed by gating network for expert routes
+            input_ids (Tensor): input sequence of token ids
+            attention_mask (Tensor): used to mask padding tokens when batch training with samples of different lengths
+        """
+        _, top1_indices = gate_scores.topk(1, dim=-1)
+        
+        ## below contains tricks to make gate_scores differentiable
+        ## see: https://github.com/kyegomez/SwitchTransformers/blob/main/switch_transformers/model.py
+        mask = torch.zeros_like(gate_scores).scatter_(
+            1, top1_indices, 1
+        )
+        masked_gate_scores = gate_scores * mask
+        denominators = masked_gate_scores.sum(-1, keepdim=True) + self.epsilon
+        
+        # Norm gate scores to sum to 1
+        norm_gate_scores = masked_gate_scores / denominators
+
+        combined_output = torch.zeros(input_ids.shape + (self.vocab_size, ),
+                                      dtype=self.config.torch_dtype,
+                                      device=self.device)
+        
+        # For each expert, process only the samples routed to it.
+        for expert_idx in range(self.n_experts):
+            mask = (top1_indices.squeeze(1) == expert_idx) # mask over batches
+            if not mask.any():
+                # expert was not selected across entire batch
+                continue
+            
+            # input_ids and attention masks for seleted samples in batch
+            selected_input_ids = input_ids[mask]
+            selected_attn_mask = attention_mask[mask] if attention_mask is not None else None
+
+            self.expert.set_adapter(str(expert_idx))
+            expert_out = self.expert(selected_input_ids, selected_attn_mask)
+            combined_output[mask] = expert_out.logits
+
+        # logits = combined_outputs with gate_scores connection
+        return combined_output * norm_gate_scores.gather(1, top1_indices).unsqueeze(-1)
+
 
     def save_pretrained(self, save_directory: str, **kwargs):
         os.makedirs(save_directory, exist_ok=True)
