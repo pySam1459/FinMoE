@@ -81,7 +81,7 @@ class FastGating(GatingBase):
     def __init__(self, config: FinMoEConfig, llama: LlamaModel):
         super(FastGating, self).__init__()
 
-        self.embed_tokens = llama.embed_tokens
+        self.embed_tokens = llama.model.model.embed_tokens
         self.w_gate = nn.Linear(llama.config.hidden_size, config.n_experts, bias=False) # (C, E)
 
         self.temperature = 1.0
@@ -123,7 +123,7 @@ class LlamaGating(GatingBase):
         llama (LlamaModel): base llama model reference
         num_experts (int): number of expert models `w_gate` should project to
     """
-    def __init__(self, config: FinMoEConfig, llama: LlamaModel):
+    def __init__(self, config: FinMoEConfig, llama: PeftModel):
         super(LlamaGating, self).__init__()
 
         self.llama = llama
@@ -144,8 +144,13 @@ class LlamaGating(GatingBase):
             gate_scores (Tensor): scores for each expert for next token prediction determined by network, size (E,)
         """
         # compute logits using llama forward pass and w_gate
-        outputs = self.llama(input_ids=input_ids, attention_mask=attention_mask)
-        logits = self.w_gate(outputs.last_hidden_state) # (B, T, E)
+        if self.training: # ensure that only the base model is being used
+            self.llama.disable_adapter()
+
+        outputs = self.llama.forward(input_ids=input_ids,
+                                     attention_mask=attention_mask,
+                                     output_hidden_states=True)
+        logits = self.w_gate(outputs.hidden_states[-1]) # (B, T, E)
 
         # select logit repr'ing token to be generated, across batch
         batch_size = input_ids.shape[0]
@@ -182,7 +187,7 @@ class FinMoE(PreTrainedModel):
 
         # pass frozen LlamaModel to Top3Gating
         if config.g_net_id in FinMoE.gating_networks:
-            self.gate = FinMoE.gating_networks[config.g_net_id](config, llama.model)
+            self.gate = FinMoE.gating_networks[config.g_net_id](config, self.expert)
         else:
             avail_networks = ", ".join(FinMoE.gating_networks.keys())
             raise ValueError(f"FinMoEConfig g_net_id {config.g_net_id} is invalid. Available gating networks: {avail_networks}")
