@@ -1,7 +1,10 @@
+import pandas as pd
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from datasets import Dataset, interleave_datasets
 from transformers.tokenization_utils import PreTrainedTokenizer
-from typing import Any
+from typing import Callable, Optional, Any
 
 
 @dataclass
@@ -23,6 +26,7 @@ class DatasetArgs:
     token_opts: dict[str, list[int]]
     token_list: list[int]
 
+    rng_seed: int = 42
     max_length: int = 256
 
 
@@ -105,3 +109,28 @@ def get_dataset_args(tokenizer: PreTrainedTokenizer, hub_basepath: Path) -> Data
         token_opts = token_opts,
         token_list = token_list,
     )
+
+
+def load_train_datasets(args: DatasetArgs,
+                        preprocess_func: Callable,
+                        nrows: Optional[list[int]] = None):
+
+    dataset_list = []
+    for i, (dataset_id, dataset_path) in enumerate(args.paths.items()):
+        train_subset = pd.read_csv(dataset_path / "train.csv",
+                                    delimiter=args.del_mapping[dataset_id],
+                                    names=args.names_mapping[dataset_id],
+                                    nrows=nrows[i] if nrows is not None else None)
+
+        __preprocess_func = partial(preprocess_func, args, dataset_id)
+        dataset_list.append(Dataset
+                            .from_pandas(train_subset)
+                            .map(__preprocess_func,
+                                batched=False,
+                                remove_columns=args.columns[dataset_id])
+                            .filter(lambda sample: len(sample["input_ids"]) <= args.max_length))
+
+    n_datasets = len(dataset_list)
+    return interleave_datasets(dataset_list, 
+                               probabilities=[1/n_datasets]*n_datasets,
+                               seed=args.rng_seed)
