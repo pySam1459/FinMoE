@@ -217,7 +217,7 @@ class FinMoE(PreTrainedModel):
         Args:
             input_ids (Tensor): input sequence of token ids
             attention_mask (Tensor | None): used to mask padding tokens when batch training with samples of different lengths
-            labels (Tensor | None): 
+            labels (Tensor | None): annotated labels provided by testset
         """
         # expert routing produces gate scores
         gate_scores = self.gate.forward(input_ids, attention_mask)  # (B, E)
@@ -319,7 +319,11 @@ class FinMoE(PreTrainedModel):
                       attention_mask: Optional[torch.Tensor],
                       **loss_kwargs) -> torch.Tensor:
         """
-        Computes the loss for CausalLM or TokenClassificatoin
+        Computes the loss for CausalLM or TokenClassification
+        Args:
+            logits (Tensor): output logits from language model
+            labels (Tensor): annotated labels provided by testset
+            attention_mask (Tensor | None): used to mask padding tokens when batch training with samples of different lengths
         """
         if self.config.loss_type == "ForCausalLM":
             return ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size, **loss_kwargs)

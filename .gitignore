@@ -7,5 +7,6 @@ scores-*.txt
 eval-short.ipynb
 FinMoE.ipynb
 visualise.ipynb
+qualitative-analysis.ipynb
 
 *.zip

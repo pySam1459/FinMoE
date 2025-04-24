@@ -1,6 +1,8 @@
 # FinMoE
 
-This repo contains the code for "FinMoE: A mixture of experts finance language model" paper by Samuel Barnett, supervised by Dr JingJing Deng, submitted as part of the degree of MEng Computer Science to the Board of Examiners in the Department of Computer Sciences, Durham University.
+This repo contains the code for "FinMoE: A Mixture of Experts Finance Language Model" paper by Samuel Barnett, supervised by Dr JingJing Deng, submitted as part of the degree of MEng Computer Science to the Board of Examiners in the Department of Computer Sciences, Durham University.
+
+Ensure you have installed the necessary packages found in [`requirements.txt`](./requirements.txt), along with PyTorch and CUDA.
 
 To train and run FinMoE:
 1. Download the base Llama 3.2-1B model, [`llama-3.2-download.ipynb`](./llama-3.2-download.ipynb).
